@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import { extractCodexSessionId } from "@/app/v1/_lib/codex/session-extractor";
 import { sanitizeHeaders } from "@/app/v1/_lib/proxy/errors";
 import { logger } from "@/lib/logger";
+import { getRedisClient } from "@/lib/redis";
 import { normalizeRequestSequence } from "@/lib/utils/request-sequence";
 import type {
   ActiveSessionInfo,
@@ -11,7 +12,6 @@ import type {
   SessionStoreInfo,
   SessionUsageUpdate,
 } from "@/types/session";
-import { getRedisClient } from "./redis";
 import { SessionTracker } from "./session-tracker";
 
 function headersToSanitizedObject(headers: Headers): Record<string, string> {
@@ -320,6 +320,44 @@ export class SessionManager {
 
     // 1. 优先使用客户端传递的 session_id (来自 metadata.user_id 或 metadata.session_id)
     if (clientSessionId) {
+      // 安全修复：在复用客户端 sessionId 前，先验证该 session 是否已被其他 Key 占用。
+      // 目的：避免跨 Key/跨用户 sessionId 碰撞导致的统计聚合混淆与潜在信息泄露。
+      if (redis && redis.status === "ready") {
+        try {
+          const ownerKey = `session:${clientSessionId}:key`;
+          const existingOwner = await redis.get(ownerKey);
+
+          if (existingOwner && existingOwner !== keyId.toString()) {
+            const newId = SessionManager.generateSessionId();
+
+            // 记录新 session 的 owner 关系（best-effort）
+            void SessionManager.storeSessionOwner(newId, keyId);
+
+            logger.warn("SessionManager: Client sessionId collision detected, generating new", {
+              sessionId: clientSessionId,
+              keyId,
+              existingOwner,
+              newSessionId: newId,
+            });
+
+            return newId;
+          }
+
+          // session owner 未记录时写入（best-effort），避免后续 legacy/mapping 误复用
+          if (!existingOwner) {
+            await redis.setex(ownerKey, SessionManager.SESSION_TTL, keyId.toString());
+          } else {
+            await redis.expire(ownerKey, SessionManager.SESSION_TTL);
+          }
+        } catch (error) {
+          logger.error("SessionManager: Failed to validate client session ownership", {
+            error,
+            sessionId: clientSessionId,
+            keyId,
+          });
+        }
+      }
+
       // 2. 短上下文并发检测（方案E）
       if (
         SessionManager.ENABLE_SHORT_CONTEXT_DETECTION &&
@@ -381,17 +419,55 @@ export class SessionManager {
     // 3. 尝试从 Redis 查找已有 session
     if (redis && redis.status === "ready") {
       try {
-        const hashKey = `hash:${contentHash}:session`;
-        const existingSessionId = await redis.get(hashKey);
+        // 安全修复：contentHash 映射按 keyId 隔离，防止跨 Key 的 session 碰撞。
+        const scopedHashKey = `hash:${keyId}:${contentHash}:session`;
+        const existingSessionId = await redis.get(scopedHashKey);
 
         if (existingSessionId) {
-          // 找到已有 session，刷新 TTL
-          await SessionManager.refreshSessionTTL(existingSessionId);
-          logger.trace("SessionManager: Reusing session via hash", {
+          // 防御性：验证 session owner，避免异常数据导致跨 Key 复用
+          const owner = await redis.get(`session:${existingSessionId}:key`);
+          if (owner && owner === keyId.toString()) {
+            // 找到已有 session，刷新 TTL
+            await SessionManager.refreshSessionTTL(existingSessionId);
+            logger.trace("SessionManager: Reusing session via scoped hash", {
+              sessionId: existingSessionId,
+              hash: contentHash,
+              keyId,
+            });
+            return existingSessionId;
+          }
+
+          logger.warn("SessionManager: Scoped hash points to session owned by other key, ignore", {
             sessionId: existingSessionId,
             hash: contentHash,
+            keyId,
+            owner,
           });
-          return existingSessionId;
+        }
+
+        // 兼容：旧版本使用的全局 hash key（不含 keyId）
+        // 仅当校验 owner=当前 keyId 时才允许复用，并迁移到新 key
+        const legacyHashKey = `hash:${contentHash}:session`;
+        const legacySessionId = await redis.get(legacyHashKey);
+        if (legacySessionId) {
+          const owner = await redis.get(`session:${legacySessionId}:key`);
+          if (owner && owner === keyId.toString()) {
+            await redis.setex(scopedHashKey, SessionManager.SESSION_TTL, legacySessionId);
+            await SessionManager.refreshSessionTTL(legacySessionId);
+            logger.trace("SessionManager: Migrated legacy hash mapping to scoped key", {
+              sessionId: legacySessionId,
+              hash: contentHash,
+              keyId,
+            });
+            return legacySessionId;
+          }
+
+          logger.warn("SessionManager: Legacy hash collision detected, ignore", {
+            sessionId: legacySessionId,
+            hash: contentHash,
+            keyId,
+            owner,
+          });
         }
 
         // 未找到：创建新 session
@@ -403,6 +479,7 @@ export class SessionManager {
         logger.trace("SessionManager: Created new session with hash", {
           sessionId: newSessionId,
           hash: contentHash,
+          keyId,
         });
         return newSessionId;
       } catch (error) {
@@ -429,7 +506,7 @@ export class SessionManager {
 
     try {
       const pipeline = redis.pipeline();
-      const hashKey = `hash:${contentHash}:session`;
+      const hashKey = `hash:${keyId}:${contentHash}:session`;
 
       // 存储映射关系
       pipeline.setex(hashKey, SessionManager.SESSION_TTL, sessionId);
@@ -446,6 +523,33 @@ export class SessionManager {
     } catch (error) {
       logger.error("SessionManager: Failed to store session mapping", {
         error,
+      });
+    }
+  }
+
+  /**
+   * 仅记录 session owner（keyId），用于防御性校验与隔离。
+   *
+   * 注意：best-effort，不应阻塞主请求流程。
+   */
+  private static async storeSessionOwner(sessionId: string, keyId: number): Promise<void> {
+    const redis = getRedisClient();
+    if (!redis || redis.status !== "ready") return;
+
+    try {
+      const pipeline = redis.pipeline();
+      pipeline.setex(`session:${sessionId}:key`, SessionManager.SESSION_TTL, keyId.toString());
+      pipeline.setex(
+        `session:${sessionId}:last_seen`,
+        SessionManager.SESSION_TTL,
+        Date.now().toString()
+      );
+      await pipeline.exec();
+    } catch (error) {
+      logger.error("SessionManager: Failed to store session owner", {
+        error,
+        sessionId,
+        keyId,
       });
     }
   }

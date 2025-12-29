@@ -1,12 +1,28 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { getLoginRedirectTarget, setAuthCookie, validateKey } from "@/lib/auth";
 import { logger } from "@/lib/logger";
+import { checkSameOriginForMutatingRequest } from "@/lib/security/csrf";
 
 // 需要数据库连接
 export const runtime = "nodejs";
 
 export async function POST(request: NextRequest) {
   try {
+    const sameOrigin = checkSameOriginForMutatingRequest({
+      method: request.method,
+      headers: request.headers,
+      origin: request.nextUrl.origin,
+    });
+    if (!sameOrigin.ok) {
+      logger.warn("[Auth] Blocked cross-site login attempt", {
+        reason: sameOrigin.reason,
+        origin: request.headers.get("origin"),
+        referer: request.headers.get("referer"),
+        secFetchSite: request.headers.get("sec-fetch-site"),
+      });
+      return NextResponse.json({ error: "非法请求来源" }, { status: 403 });
+    }
+
     const { key } = await request.json();
 
     if (!key) {

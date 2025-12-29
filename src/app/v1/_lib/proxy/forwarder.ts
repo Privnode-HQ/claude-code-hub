@@ -33,6 +33,7 @@ import {
   isEmptyResponseError,
   isHttp2Error,
   ProxyError,
+  sanitizeUrl,
 } from "./errors";
 import { mapClientFormatToTransformer, mapProviderTypeToTransformer } from "./format-mapper";
 import { ModelRedirector } from "./model-redirector";
@@ -865,13 +866,18 @@ export class ProxyForwarder {
       }
 
       // 3. 直接透传：使用 buildProxyUrl() 拼接原始路径和查询参数
+      // 注意：Gemini CLI 支持用 `?key=` 携带 Hub API Key（用于鉴权到本服务）。
+      // 转发到上游时必须移除该参数，避免把 Hub Key 透传给第三方/上游日志/代理链路。
       const baseUrl =
         provider.url ||
         (provider.providerType === "gemini"
           ? GEMINI_PROTOCOL.OFFICIAL_ENDPOINT
           : GEMINI_PROTOCOL.CLI_ENDPOINT);
 
-      proxyUrl = buildProxyUrl(baseUrl, session.requestUrl);
+      const upstreamRequestUrl = new URL(session.requestUrl.href);
+      upstreamRequestUrl.searchParams.delete("key");
+
+      proxyUrl = buildProxyUrl(baseUrl, upstreamRequestUrl);
       processedHeaders = headers;
 
       if (session.sessionId) {
@@ -885,7 +891,7 @@ export class ProxyForwarder {
       logger.debug("ProxyForwarder: Gemini request passthrough", {
         providerId: provider.id,
         type: provider.providerType,
-        url: proxyUrl,
+        url: sanitizeUrl(proxyUrl),
         originalPath: session.requestUrl.pathname,
         isStreaming,
         isApiKey,
@@ -1089,11 +1095,11 @@ export class ProxyForwarder {
       proxyUrl = buildProxyUrl(effectiveBaseUrl, session.requestUrl);
 
       logger.debug("ProxyForwarder: Final proxy URL", {
-        url: proxyUrl,
+        url: sanitizeUrl(proxyUrl),
         originalPath: session.requestUrl.pathname,
         providerType: provider.providerType,
         mcpPassthroughType: provider.mcpPassthroughType,
-        usedBaseUrl: effectiveBaseUrl,
+        usedBaseUrl: sanitizeUrl(effectiveBaseUrl),
       });
 
       const hasBody = session.method !== "GET" && session.method !== "HEAD";
@@ -1114,7 +1120,7 @@ export class ProxyForwarder {
           logger.trace("ProxyForwarder: Forwarding request", {
             provider: provider.name,
             providerId: provider.id,
-            proxyUrl: proxyUrl,
+            proxyUrl: sanitizeUrl(proxyUrl),
             format: session.originalFormat,
             method: session.method,
             bodyLength: bodyString.length,
@@ -1239,7 +1245,7 @@ export class ProxyForwarder {
       logger.info("ProxyForwarder: Using proxy", {
         providerId: provider.id,
         providerName: provider.name,
-        proxyUrl: proxyConfig.proxyUrl,
+        proxyUrl: sanitizeUrl(proxyConfig.proxyUrl),
         fallbackToDirect: proxyConfig.fallbackToDirect,
         targetUrl: new URL(proxyUrl).origin,
         http2Enabled: proxyConfig.http2Enabled,
@@ -1506,7 +1512,7 @@ export class ProxyForwarder {
           logger.error("ProxyForwarder: Proxy connection failed", {
             providerId: provider.id,
             providerName: provider.name,
-            proxyUrl: proxyConfig.proxyUrl,
+            proxyUrl: sanitizeUrl(proxyConfig.proxyUrl),
             fallbackToDirect: proxyConfig.fallbackToDirect,
             errorType: err.constructor.name,
             errorMessage: err.message,
@@ -1564,7 +1570,7 @@ export class ProxyForwarder {
               .join("\n"),
             errorStack: err.stack?.split("\n").slice(0, 3).join("\n"), // 前3行堆栈
 
-            targetUrl: proxyUrl, // 完整目标 URL（用于调试）
+            targetUrl: sanitizeUrl(proxyUrl), // 脱敏后的完整目标 URL（用于调试）
             headerKeys: Array.from(processedHeaders.keys()),
             headerCount: Array.from(processedHeaders.keys()).length,
             invalidHeaders: Array.from(processedHeaders.entries())
@@ -1602,7 +1608,7 @@ export class ProxyForwarder {
             .join("\n"),
           errorStack: err.stack?.split("\n").slice(0, 3).join("\n"), // 前3行堆栈
 
-          targetUrl: proxyUrl, // 完整目标 URL（用于调试）
+          targetUrl: sanitizeUrl(proxyUrl), // 脱敏后的完整目标 URL（用于调试）
           headerKeys: Array.from(processedHeaders.keys()),
           headerCount: Array.from(processedHeaders.keys()).length,
           invalidHeaders: Array.from(processedHeaders.entries())

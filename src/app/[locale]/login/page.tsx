@@ -11,6 +11,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { LanguageSwitcher } from "@/components/ui/language-switcher";
 import { Link, useRouter } from "@/i18n/routing";
+import { toSafeRedirectPath } from "@/lib/utils/redirect";
 
 export default function LoginPage() {
   return (
@@ -61,7 +62,9 @@ function LoginPageContent() {
       }
 
       // 登录成功，按服务端返回的目标跳转，回退到原页面
-      const redirectTarget = data.redirectTo || from;
+      const candidateTarget =
+        typeof data?.redirectTo === "string" && data.redirectTo ? data.redirectTo : from;
+      const redirectTarget = toSafeRedirectPath(candidateTarget, "/dashboard");
       router.push(redirectTarget);
       router.refresh();
     } catch {

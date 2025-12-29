@@ -1,6 +1,6 @@
 "use server";
 
-import { and, eq, gte, isNull, lt, sql } from "drizzle-orm";
+import { and, eq, gte, isNull, like, lt, lte, sql } from "drizzle-orm";
 import { db } from "@/drizzle/db";
 import { keys, messageRequest } from "@/drizzle/schema";
 import { getEnvConfig } from "@/lib/config";
@@ -1000,37 +1000,29 @@ export async function getRateLimitEventStats(
   const timezone = getEnvConfig().TZ;
   const { user_id, provider_id, limit_type, start_time, end_time, key_id } = filters;
 
-  // 构建 WHERE 条件
-  const conditions: string[] = [
-    `${messageRequest.errorMessage.name} LIKE '%rate_limit_metadata%'`,
-    `${messageRequest.deletedAt.name} IS NULL`,
+  // 构建 WHERE 条件（避免 sql.raw 拼接，防止潜在 SQL 注入与参数错位）
+  const whereConditions = [
+    like(messageRequest.errorMessage, "%rate_limit_metadata%"),
+    isNull(messageRequest.deletedAt),
   ];
 
-  const params: (string | number | Date)[] = [];
-  let paramIndex = 1;
-
   if (user_id !== undefined) {
-    conditions.push(`${messageRequest.userId.name} = $${paramIndex++}`);
-    params.push(user_id);
+    whereConditions.push(eq(messageRequest.userId, user_id));
   }
 
   if (provider_id !== undefined) {
-    conditions.push(`${messageRequest.providerId.name} = $${paramIndex++}`);
-    params.push(provider_id);
+    whereConditions.push(eq(messageRequest.providerId, provider_id));
   }
 
   if (start_time) {
-    conditions.push(`${messageRequest.createdAt.name} >= $${paramIndex++}`);
-    params.push(start_time);
+    whereConditions.push(gte(messageRequest.createdAt, start_time));
   }
 
   if (end_time) {
-    conditions.push(`${messageRequest.createdAt.name} <= $${paramIndex++}`);
-    params.push(end_time);
+    whereConditions.push(lte(messageRequest.createdAt, end_time));
   }
 
   // Key ID 过滤需要先查询 key 字符串
-  let keyString: string | null = null;
   if (key_id !== undefined) {
     const keyRecord = await db
       .select({ key: keys.key })
@@ -1039,9 +1031,7 @@ export async function getRateLimitEventStats(
       .limit(1);
 
     if (keyRecord && keyRecord.length > 0) {
-      keyString = keyRecord[0].key;
-      conditions.push(`${messageRequest.key.name} = $${paramIndex++}`);
-      params.push(keyString);
+      whereConditions.push(eq(messageRequest.key, keyRecord[0].key));
     } else {
       // Key 不存在，返回空统计
       return {
@@ -1055,27 +1045,21 @@ export async function getRateLimitEventStats(
     }
   }
 
-  // 查询所有符合条件的限流事件
-  const query = sql`
-    SELECT
-      ${messageRequest.id},
-      ${messageRequest.userId},
-      ${messageRequest.providerId},
-      ${messageRequest.errorMessage},
-      DATE_TRUNC('hour', ${messageRequest.createdAt} AT TIME ZONE ${timezone}) AS hour
-    FROM ${messageRequest}
-    WHERE ${sql.raw(conditions.join(" AND "))}
-    ORDER BY ${messageRequest.createdAt}
-  `;
+  const hourExpr =
+    sql<Date>`DATE_TRUNC('hour', ${messageRequest.createdAt} AT TIME ZONE ${timezone})`.as("hour");
 
-  const result = await db.execute(query);
-  const rows = Array.from(result) as Array<{
-    id: number;
-    user_id: number;
-    provider_id: number;
-    error_message: string;
-    hour: Date;
-  }>;
+  // 查询所有符合条件的限流事件
+  const rows = await db
+    .select({
+      id: messageRequest.id,
+      user_id: messageRequest.userId,
+      provider_id: messageRequest.providerId,
+      error_message: messageRequest.errorMessage,
+      hour: hourExpr,
+    })
+    .from(messageRequest)
+    .where(and(...whereConditions))
+    .orderBy(messageRequest.createdAt);
 
   // 初始化聚合数据
   const eventsByType: Record<string, number> = {};
@@ -1088,6 +1072,9 @@ export async function getRateLimitEventStats(
   // 处理每条记录
   for (const row of rows) {
     // 解析 rate_limit_metadata JSON
+    if (!row.error_message) {
+      continue;
+    }
     const metadataMatch = row.error_message.match(/rate_limit_metadata:\s*(\{[^}]+\})/);
     if (!metadataMatch) {
       continue;

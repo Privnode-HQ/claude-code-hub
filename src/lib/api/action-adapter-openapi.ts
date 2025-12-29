@@ -14,6 +14,7 @@ import { getCookie } from "hono/cookie";
 import type { ActionResult } from "@/actions/types";
 import { validateKey } from "@/lib/auth";
 import { logger } from "@/lib/logger";
+import { redactSensitiveForLogging } from "@/lib/utils/redact";
 
 // Server Action 函数签名 (支持两种格式)
 type ServerAction =
@@ -309,7 +310,7 @@ export function createActionRoute(
       // 2. 调用 Server Action
       // 如果提供了 argsMapper，使用它来映射参数
       // 否则使用默认的参数推断逻辑
-      logger.debug(`[ActionAPI] Calling ${fullPath}`, { body });
+      logger.debug(`[ActionAPI] Calling ${fullPath}`, { body: redactSensitiveForLogging(body) });
 
       let args: unknown[];
 
